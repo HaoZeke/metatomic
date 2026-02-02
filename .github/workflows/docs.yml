@@ -30,13 +30,13 @@ jobs:
       - name: install dependencies
         run: |
           python -m pip install tox
-          sudo apt install doxygen
+          sudo apt install doxygen nushell
 
       - name: build documentation
         env:
           # Use the CPU only version of torch when building/running the code
           PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
-        run: tox -e docs
+        run: nu scripts/mkdoc.nu
 
       - name: store documentation as github artifact to be downloaded by users
         uses: actions/upload-artifact@v6
