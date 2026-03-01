@@ -67,6 +67,15 @@ def __getattr__(name):
     # ``metatomic.torch.ase_calculator`` without requiring a separate import from
     # ``metatomic.torch``, but only importing the code when actually required.
     if name == "ase_calculator":
+        import warnings
+
+        warnings.warn(
+            "Importing 'metatomic.torch.ase_calculator' is deprecated. "
+            "Use 'metatomic.ase' instead (install metatomic-ase). "
+            "This import path will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         import metatomic.torch.ase_calculator
 
         return metatomic.torch.ase_calculator

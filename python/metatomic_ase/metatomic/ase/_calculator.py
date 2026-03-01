@@ -11,7 +11,7 @@ import vesin.metatomic
 from metatensor.torch import Labels, TensorBlock, TensorMap
 from torch.profiler import record_function
 
-from . import (
+from metatomic.torch import (
     AtomisticModel,
     ModelEvaluationOptions,
     ModelMetadata,
@@ -43,14 +43,6 @@ except ImportError:
 FilePath = Union[str, bytes, pathlib.PurePath]
 
 LOGGER = logging.getLogger(__name__)
-
-warnings.warn(
-    "Importing 'metatomic.torch.ase_calculator' is deprecated. "
-    "Use 'metatomic.ase' instead (install metatomic-ase). "
-    "This import path will be removed in a future release.",
-    DeprecationWarning,
-    stacklevel=2,
-)
 
 
 STR_TO_DTYPE = {
