@@ -47,6 +47,8 @@ else:
     pick_device = torch.ops.metatomic.pick_device
     pick_output = torch.ops.metatomic.pick_output
 
+from .adapters import ModelAdapter  # noqa: F401
+from .export import export_model  # noqa: F401
 from .model import (  # noqa: F401
     AtomisticModel,
     ModelInterface,

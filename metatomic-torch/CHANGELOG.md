@@ -17,6 +17,13 @@ a changelog](https://keepachangelog.com/en/1.1.0/) format. This project follows
 ### Removed
 -->
 
+### Added
+
+- `ModelAdapter` base class for wrapping simple energy functions into the full
+  `ModelInterface` protocol without manual TensorMap construction
+- `export_model()` convenience function for one-call model export to `.pt`
+  files without requiring metatrain
+
 ## [Version 0.1.9](https://github.com/metatensor/metatomic/releases/tag/metatomic-torch-v0.1.9) - 2026-02-23
 
 ### Changed
