@@ -1,4 +1,0 @@
-Initial release of ``metatomic-torchsim`` with ``MetatomicModel`` wrapper
-adapting metatomic models to TorchSim's ``ModelInterface`` protocol.
-Supports batched simulations, output variants, uncertainty quantification,
-non-conservative forces/stress, and additional model outputs.
