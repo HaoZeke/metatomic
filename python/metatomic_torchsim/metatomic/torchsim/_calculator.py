@@ -4,17 +4,20 @@ Adapts metatomic models to the TorchSim ModelInterface protocol, allowing them t
 be used within the torch-sim simulation framework for MD and other simulations.
 
 Supports batched computations for multiple systems simultaneously, computing
-energies, forces, and stresses via autograd.
+energies, forces, and stresses via autograd.  Supports output variants,
+uncertainty quantification, non-conservative forces/stress, and additional
+model outputs.
 """
 
 import logging
 import os
 import pathlib
+import warnings
 from typing import Dict, List, Optional, Union
 
 import torch
 import vesin.metatomic
-from metatensor.torch import Labels, TensorBlock
+from metatensor.torch import Labels, TensorBlock, TensorMap
 
 from metatomic.torch import (
     AtomisticModel,
@@ -24,6 +27,7 @@ from metatomic.torch import (
     System,
     load_atomistic_model,
     pick_device,
+    pick_output,
 )
 
 
@@ -63,6 +67,9 @@ class MetatomicModel(ModelInterface):
     ``SimState`` and metatomic's list-of-``System`` convention, and uses autograd
     for force/stress derivatives.
 
+    Supports output variants, uncertainty quantification, non-conservative
+    forces/stress, and arbitrary additional model outputs.
+
     Neighbor lists are computed with vesin, or with nvalchemiops on CUDA when
     available and the model requests full neighbor lists.
     """
@@ -76,6 +83,10 @@ class MetatomicModel(ModelInterface):
         check_consistency: bool = False,
         compute_forces: bool = True,
         compute_stress: bool = True,
+        variants: Optional[Dict[str, Optional[str]]] = None,
+        non_conservative: bool = False,
+        uncertainty_threshold: Optional[float] = 0.1,
+        additional_outputs: Optional[Dict[str, ModelOutput]] = None,
     ) -> None:
         """Initialize the metatomic model wrapper.
 
@@ -90,12 +101,31 @@ class MetatomicModel(ModelInterface):
             device is selected from the model's ``supported_devices``.
         :param check_consistency: Run consistency checks during model evaluation.
             Useful for debugging but hurts performance.
-        :param compute_forces: Compute atomic forces via autograd.
-        :param compute_stress: Compute stress tensors via the strain trick.
+        :param compute_forces: Compute atomic forces via autograd (or from
+            non-conservative model outputs when ``non_conservative=True``).
+        :param compute_stress: Compute stress tensors via the strain trick (or
+            from non-conservative model outputs when ``non_conservative=True``).
+        :param variants: Dictionary mapping output names to a variant that should
+            be used for the calculations (e.g. ``{"energy": "PBE"}``).  If
+            ``"energy"`` is set to a variant, the uncertainty and non-conservative
+            outputs will also use this variant unless overridden explicitly.
+        :param non_conservative: If ``True``, use the model's non-conservative
+            force and stress outputs directly instead of computing them via
+            autograd.  Can be faster but may sacrifice physical correctness.
+        :param uncertainty_threshold: Threshold for per-atom energy uncertainty
+            in eV.  When the model supports uncertainty estimation and any atom
+            exceeds this threshold, a warning is emitted.  Set to ``None`` to
+            disable uncertainty quantification.
+        :param additional_outputs: Dictionary of additional
+            :py:class:`ModelOutput` requests passed to the model.  Results are
+            stored in :py:attr:`additional_outputs` as raw
+            :py:class:`TensorMap` values.
         """
         super().__init__()
 
         self._check_consistency = check_consistency
+        self._non_conservative = non_conservative
+        self._uncertainty_threshold = uncertainty_threshold
 
         # Load the model, following the same patterns as ase_calculator.py
         if isinstance(model, str) and model == "pet-mad":
@@ -144,11 +174,78 @@ class MetatomicModel(ModelInterface):
                 f"unexpected dtype in model capabilities: {capabilities.dtype}"
             )
 
-        if "energy" not in capabilities.outputs:
+        # -- Resolve output keys via variants --
+        outputs = capabilities.outputs
+        variants = variants or {}
+        default_variant = variants.get("energy")
+
+        resolved_variants = {
+            key: variants.get(key, default_variant)
+            for key in [
+                "energy",
+                "energy_uncertainty",
+                "non_conservative_forces",
+                "non_conservative_stress",
+            ]
+        }
+
+        has_energy = any(
+            "energy" == key or key.startswith("energy/") for key in outputs.keys()
+        )
+        if not has_energy:
             raise ValueError(
                 "model does not have an 'energy' output. "
                 "Only models with energy outputs can be used with TorchSim."
             )
+
+        self._energy_key = pick_output("energy", outputs, resolved_variants["energy"])
+
+        # Uncertainty output resolution
+        has_energy_uq = any("energy_uncertainty" in key for key in outputs.keys())
+        if has_energy_uq and uncertainty_threshold is not None:
+            self._energy_uq_key = pick_output(
+                "energy_uncertainty",
+                outputs,
+                resolved_variants["energy_uncertainty"],
+            )
+        else:
+            self._energy_uq_key = "energy_uncertainty"
+
+        # Non-conservative output resolution
+        if non_conservative:
+            if (
+                "non_conservative_stress" in variants
+                and "non_conservative_forces" in variants
+                and (
+                    (variants["non_conservative_stress"] is None)
+                    != (variants["non_conservative_forces"] is None)
+                )
+            ):
+                raise ValueError(
+                    "if both 'non_conservative_stress' and "
+                    "'non_conservative_forces' are present in `variants`, they "
+                    "must either be both `None` or both not `None`."
+                )
+
+            self._nc_forces_key = pick_output(
+                "non_conservative_forces",
+                outputs,
+                resolved_variants["non_conservative_forces"],
+            )
+            self._nc_stress_key = pick_output(
+                "non_conservative_stress",
+                outputs,
+                resolved_variants["non_conservative_stress"],
+            )
+        else:
+            self._nc_forces_key = "non_conservative_forces"
+            self._nc_stress_key = "non_conservative_stress"
+
+        # Additional output requests
+        if additional_outputs is None:
+            self._additional_output_requests: Dict[str, ModelOutput] = {}
+        else:
+            self._additional_output_requests = additional_outputs
 
         self._model = model.to(device=self._device)
         self._compute_forces = compute_forces
@@ -156,11 +253,54 @@ class MetatomicModel(ModelInterface):
         self._memory_scales_with = "n_atoms_x_density"
         self._requested_neighbor_lists = self._model.requested_neighbor_lists()
 
-        self._evaluation_options = ModelEvaluationOptions(
+        # Check if model supports per-atom uncertainty
+        self._calculate_uncertainty = (
+            self._energy_uq_key in self._model.capabilities().outputs
+            and self._model.capabilities().outputs[self._energy_uq_key].per_atom
+            and uncertainty_threshold is not None
+        )
+        if self._calculate_uncertainty:
+            if uncertainty_threshold <= 0.0:
+                raise ValueError(
+                    f"`uncertainty_threshold` is {uncertainty_threshold} but must "
+                    "be positive"
+                )
+
+        # Build the base evaluation options
+        self._evaluation_options = self._build_evaluation_options()
+
+        #: Additional outputs from the most recent :py:meth:`forward` call,
+        #: stored as raw :py:class:`TensorMap` values keyed by output name.
+        self.additional_outputs: Dict[str, TensorMap] = {}
+
+    def _build_evaluation_options(self) -> ModelEvaluationOptions:
+        """Construct ModelEvaluationOptions from the current configuration."""
+        model_outputs: Dict[str, ModelOutput] = {}
+
+        model_outputs[self._energy_key] = ModelOutput(
+            quantity="energy", unit="eV", per_atom=False
+        )
+
+        if self._calculate_uncertainty:
+            model_outputs[self._energy_uq_key] = ModelOutput(
+                quantity="energy", unit="eV", per_atom=True
+            )
+
+        if self._non_conservative:
+            if self._compute_forces:
+                model_outputs[self._nc_forces_key] = ModelOutput(
+                    quantity="force", unit="eV/Angstrom", per_atom=True
+                )
+            if self._compute_stress:
+                model_outputs[self._nc_stress_key] = ModelOutput(
+                    quantity="pressure", unit="eV/Angstrom^3", per_atom=False
+                )
+
+        model_outputs.update(self._additional_output_requests)
+
+        return ModelEvaluationOptions(
             length_unit="angstrom",
-            outputs={
-                "energy": ModelOutput(quantity="energy", unit="eV", per_atom=False)
-            },
+            outputs=model_outputs,
         )
 
     @staticmethod
@@ -176,7 +316,9 @@ class MetatomicModel(ModelInterface):
 
         return load_model(path).export()
 
-    def forward(self, state: "ts.SimState | StateDict") -> Dict[str, torch.Tensor]:
+    def forward(  # noqa: C901, PLR0912
+        self, state: "ts.SimState | StateDict"
+    ) -> Dict[str, torch.Tensor]:
         """Compute energies, forces, and stresses for the given simulation state.
 
         :param state: TorchSim simulation state or state dictionary containing
@@ -185,6 +327,8 @@ class MetatomicModel(ModelInterface):
         :returns: Dictionary with ``"energy"`` (shape ``[n_systems]``),
             ``"forces"`` (shape ``[n_atoms, 3]``, if ``compute_forces``), and
             ``"stress"`` (shape ``[n_systems, 3, 3]``, if ``compute_stress``).
+            When uncertainty is enabled, ``"energy_uncertainty"`` (shape
+            ``[n_atoms, 1]``) is also included.
         """
         sim_state = (
             state
@@ -207,6 +351,7 @@ class MetatomicModel(ModelInterface):
         systems: List[System] = []
         strains: List[torch.Tensor] = []
         n_systems = len(cell)
+        use_autograd = not self._non_conservative
 
         for sys_idx in range(n_systems):
             mask = sim_state.system_idx == sys_idx
@@ -214,10 +359,10 @@ class MetatomicModel(ModelInterface):
             sys_cell = cell[sys_idx]
             sys_types = atomic_nums[mask]
 
-            if self._compute_forces:
+            if use_autograd and self._compute_forces:
                 sys_positions = sys_positions.detach().requires_grad_(True)
 
-            if self._compute_stress:
+            if use_autograd and self._compute_stress:
                 strain = torch.eye(
                     3,
                     device=self._device,
@@ -251,47 +396,85 @@ class MetatomicModel(ModelInterface):
             check_consistency=self._check_consistency,
         )
 
-        energy_values = model_outputs["energy"].block().values
+        energy_values = model_outputs[self._energy_key].block().values
 
         results: Dict[str, torch.Tensor] = {}
         results["energy"] = energy_values.detach().squeeze(-1)
 
-        # Compute forces and/or stresses via autograd
-        if self._compute_forces or self._compute_stress:
-            grad_inputs: List[torch.Tensor] = []
+        # -- Uncertainty warning --
+        if self._calculate_uncertainty:
+            uncertainty = model_outputs[self._energy_uq_key].block().values
+            results["energy_uncertainty"] = uncertainty.detach()
+
+            threshold = self._uncertainty_threshold
+            if threshold is not None:
+                uq_vals = uncertainty.detach()
+                if torch.any(uq_vals > threshold):
+                    exceeded = torch.where(uq_vals.squeeze(-1) > threshold)[0]
+                    warnings.warn(
+                        "Some of the atomic energy uncertainties are larger "
+                        f"than the threshold of {threshold} eV. The prediction "
+                        f"is above the threshold for atoms {exceeded.tolist()}.",
+                        stacklevel=2,
+                    )
+
+        # -- Forces and stresses --
+        if self._non_conservative:
+            # Use model-provided non-conservative outputs directly
             if self._compute_forces:
-                for system in systems:
-                    grad_inputs.append(system.positions)
-            if self._compute_stress:
-                grad_inputs.extend(strains)
-
-            grads = torch.autograd.grad(
-                outputs=energy_values,
-                inputs=grad_inputs,
-                grad_outputs=torch.ones_like(energy_values),
-            )
-
-            if self._compute_forces and self._compute_stress:
-                n_sys = len(systems)
-                force_grads = grads[:n_sys]
-                stress_grads = grads[n_sys:]
-            elif self._compute_forces:
-                force_grads = grads
-                stress_grads = ()
-            else:
-                force_grads = ()
-                stress_grads = grads
-
-            if self._compute_forces:
-                results["forces"] = torch.cat([-g for g in force_grads])
+                nc_forces = model_outputs[self._nc_forces_key].block().values
+                nc_forces = nc_forces.detach().reshape(-1, 3)
+                # Remove spurious net force
+                nc_forces = nc_forces - nc_forces.mean(dim=0, keepdim=True)
+                results["forces"] = nc_forces
 
             if self._compute_stress:
-                results["stress"] = torch.stack(
-                    [
-                        g / torch.abs(torch.det(system.cell.detach()))
-                        for g, system in zip(stress_grads, systems, strict=False)
-                    ]
+                nc_stress = model_outputs[self._nc_stress_key].block().values
+                nc_stress = nc_stress.detach().reshape(-1, 3, 3)
+                results["stress"] = nc_stress
+        else:
+            # Compute forces and/or stresses via autograd
+            if self._compute_forces or self._compute_stress:
+                grad_inputs: List[torch.Tensor] = []
+                if self._compute_forces:
+                    for system in systems:
+                        grad_inputs.append(system.positions)
+                if self._compute_stress:
+                    grad_inputs.extend(strains)
+
+                grads = torch.autograd.grad(
+                    outputs=energy_values,
+                    inputs=grad_inputs,
+                    grad_outputs=torch.ones_like(energy_values),
                 )
+
+                if self._compute_forces and self._compute_stress:
+                    n_sys = len(systems)
+                    force_grads = grads[:n_sys]
+                    stress_grads = grads[n_sys:]
+                elif self._compute_forces:
+                    force_grads = grads
+                    stress_grads = ()
+                else:
+                    force_grads = ()
+                    stress_grads = grads
+
+                if self._compute_forces:
+                    results["forces"] = torch.cat([-g for g in force_grads])
+
+                if self._compute_stress:
+                    results["stress"] = torch.stack(
+                        [
+                            g / torch.abs(torch.det(system.cell.detach()))
+                            for g, system in zip(stress_grads, systems, strict=False)
+                        ]
+                    )
+
+        # -- Additional outputs --
+        self.additional_outputs = {}
+        for name in self._additional_output_requests:
+            if name in model_outputs:
+                self.additional_outputs[name] = model_outputs[name]
 
         return results
 

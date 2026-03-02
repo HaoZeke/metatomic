@@ -132,11 +132,21 @@ def test_forward_no_forces(lj_model, ni_atoms):
     assert "stress" in output
 
 
-def test_batched_forward(metatomic_model, ni_atoms):
-    """Forward pass handles batched systems correctly."""
+def _make_ni_atoms_2():
+    """Create a second Ni supercell (same size, different lattice parameter)."""
     import ase.build
 
-    atoms_2 = ase.build.bulk("Ni", "fcc", a=3.6, cubic=True)
+    np.random.seed(0xCAFEBABE)
+    atoms = ase.build.make_supercell(
+        ase.build.bulk("Ni", "fcc", a=3.5, cubic=True), 2 * np.eye(3)
+    )
+    atoms.positions += 0.1 * np.random.rand(*atoms.positions.shape)
+    return atoms
+
+
+def test_batched_forward(metatomic_model, ni_atoms):
+    """Forward pass handles batched systems correctly."""
+    atoms_2 = _make_ni_atoms_2()
     sim_state = ts.io.atoms_to_state([ni_atoms, atoms_2], DEVICE, DTYPE)
     output = metatomic_model(sim_state)
 
@@ -148,9 +158,7 @@ def test_batched_forward(metatomic_model, ni_atoms):
 
 def test_energy_consistency_single_vs_batch(metatomic_model, ni_atoms):
     """Energy from single system matches the corresponding entry in a batch."""
-    import ase.build
-
-    atoms_2 = ase.build.bulk("Ni", "fcc", a=3.6, cubic=True)
+    atoms_2 = _make_ni_atoms_2()
 
     # single
     state_1 = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
@@ -298,3 +306,61 @@ def test_stress_is_symmetric(metatomic_model, ni_atoms):
     stress = output["stress"]
 
     torch.testing.assert_close(stress, stress.transpose(-2, -1), atol=1e-10, rtol=0)
+
+
+# -- Variant / uncertainty / NC parameter tests --
+
+
+def test_variants_none_accepted(lj_model, ni_atoms):
+    """Passing variants=None (default) works."""
+    model = MetatomicModel(model=lj_model, device=DEVICE, variants=None)
+    sim_state = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
+    output = model(sim_state)
+    assert "energy" in output
+
+
+def test_variants_empty_dict_accepted(lj_model, ni_atoms):
+    """Passing variants={} works."""
+    model = MetatomicModel(model=lj_model, device=DEVICE, variants={})
+    sim_state = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
+    output = model(sim_state)
+    assert "energy" in output
+
+
+def test_uncertainty_disabled_by_default(lj_model, ni_atoms):
+    """LJ model has no uncertainty output, so no uncertainty in results."""
+    model = MetatomicModel(model=lj_model, device=DEVICE)
+    sim_state = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
+    output = model(sim_state)
+    assert "energy_uncertainty" not in output
+
+
+def test_uncertainty_threshold_none(lj_model, ni_atoms):
+    """Setting uncertainty_threshold=None disables uncertainty."""
+    model = MetatomicModel(model=lj_model, device=DEVICE, uncertainty_threshold=None)
+    sim_state = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
+    output = model(sim_state)
+    assert "energy_uncertainty" not in output
+
+
+def test_non_conservative_false_default(lj_model, ni_atoms):
+    """Non-conservative mode off by default, autograd forces work."""
+    model = MetatomicModel(model=lj_model, device=DEVICE, non_conservative=False)
+    sim_state = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
+    output = model(sim_state)
+    assert "forces" in output
+    assert "stress" in output
+
+
+def test_additional_outputs_none(lj_model, ni_atoms):
+    """additional_outputs=None (default) produces empty dict."""
+    model = MetatomicModel(model=lj_model, device=DEVICE, additional_outputs=None)
+    sim_state = ts.io.atoms_to_state([ni_atoms], DEVICE, DTYPE)
+    model(sim_state)
+    assert model.additional_outputs == {}
+
+
+def test_bad_uncertainty_threshold_raises(lj_model):
+    """Negative uncertainty_threshold raises ValueError."""
+    with pytest.raises(ValueError, match="must be positive"):
+        MetatomicModel(model=lj_model, device=DEVICE, uncertainty_threshold=-1.0)
