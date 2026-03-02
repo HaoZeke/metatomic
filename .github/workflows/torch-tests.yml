@@ -70,6 +70,13 @@ jobs:
           METATOMIC_TESTS_TORCH_VERSION: ${{ matrix.torch-version }}
           METATOMIC_TESTS_NUMPY_VERSION_PIN:  ${{ matrix.numpy-version-pin }}
 
+      - name: run ASE wrapper tests
+        run: tox -e ase-tests
+        env:
+          PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+          METATOMIC_TESTS_TORCH_VERSION: ${{ matrix.torch-version }}
+          METATOMIC_TESTS_NUMPY_VERSION_PIN:  ${{ matrix.numpy-version-pin }}
+
       - name: combine Python coverage files
         shell: bash
         run: |

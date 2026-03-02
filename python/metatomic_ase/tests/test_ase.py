@@ -626,7 +626,7 @@ def test_neighbor_list_adapter(device, dtype, neighbor_fn):
 
     HERE = os.path.realpath(os.path.dirname(__file__))
     test_files = os.path.join(
-        HERE, "..", "..", "..", "..", "metatensor-torch", "tests", "neighbor-checks"
+        HERE, "..", "..", "..", "metatomic-torch", "tests", "neighbor-checks"
     )
 
     for path in glob.glob(os.path.join(test_files, "*.json")):

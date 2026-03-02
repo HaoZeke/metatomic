@@ -1,0 +1,3 @@
+Initial release of ``metatomic-ase`` with ``MetatomicCalculator`` and
+``SymmetrizedCalculator`` extracted from ``metatomic-torch``. Includes standalone
+documentation site (shibuya theme), independent versioning, and CI integration.
