@@ -135,6 +135,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         non_conservative=False,
         do_gradients_with_energy=True,
         uncertainty_threshold=0.1,
+        neighbor_list_skin: float = 0.0,
     ):
         """
         :param model: model to use for the calculation. This can be a file path, a
@@ -177,6 +178,11 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             (https://pubs.acs.org/doi/full/10.1021/acs.jctc.3c00704). Set this to
             ``None`` to disable uncertainty quantification even if the model supports
             it.
+        :param neighbor_list_skin: extra distance (in angstrom) for Verlet neighbor
+            list caching. When > 0, the spatial search uses ``cutoff + skin`` and
+            caches the pair topology, reusing it until any atom displaces by more
+            than ``skin / 2``. Only applies to neighbor lists with ``strict=False``.
+            Set to 0.0 (default) for stateless behavior.
         """
         super().__init__()
 
@@ -188,7 +194,11 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             "do_gradients_with_energy": bool(do_gradients_with_energy),
             "additional_outputs": additional_outputs,
             "uncertainty_threshold": uncertainty_threshold,
+            "neighbor_list_skin": float(neighbor_list_skin),
         }
+
+        self._nl_skin = float(neighbor_list_skin)
+        self._verlet_cache: Dict = {}
 
         # Load the model
         if isinstance(model, (str, bytes, pathlib.PurePath)):
@@ -337,6 +347,29 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         :py:class:`metatensor.torch.TensorMap` produced by the model.
         """
 
+    def _compute_neighbors_for_systems(
+        self, systems: List[System]
+    ) -> List[System]:
+        """Compute neighbor lists for all systems, using Verlet caching when enabled."""
+        requested_options = self._model.requested_neighbor_lists()
+        check = self.parameters["check_consistency"]
+
+        if self._nl_skin > 0:
+            _compute_requested_neighbors_with_skin(
+                systems=systems,
+                requested_options=requested_options,
+                check_consistency=check,
+                skin=self._nl_skin,
+                verlet_cache=self._verlet_cache,
+            )
+            return systems
+        else:
+            return _compute_requested_neighbors(
+                systems=systems,
+                requested_options=requested_options,
+                check_consistency=check,
+            )
+
     def todict(self):
         if "model" not in self.parameters:
             raise RuntimeError(
@@ -400,11 +433,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             systems.append(system)
 
         # Compute the neighbors lists requested by the model
-        input_systems = _compute_requested_neighbors(
-            systems=systems,
-            requested_options=self._model.requested_neighbor_lists(),
-            check_consistency=self.parameters["check_consistency"],
-        )
+        input_systems = self._compute_neighbors_for_systems(systems)
 
         available_outputs = self._model.capabilities().outputs
         for key in outputs:
@@ -540,11 +569,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         with record_function("MetatomicCalculator::compute_neighbors"):
             # convert from ase.Atoms to metatomic.torch.System
             system = System(types, positions, cell, pbc)
-            input_system = _compute_requested_neighbors(
-                systems=[system],
-                requested_options=self._model.requested_neighbor_lists(),
-                check_consistency=self.parameters["check_consistency"],
-            )[0]
+            input_system = self._compute_neighbors_for_systems([system])[0]
 
         with record_function("MetatomicCalculator::get_model_inputs"):
             for name, option in self._model.requested_inputs().items():
@@ -723,11 +748,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             systems.append(system)
 
         # Compute the neighbors lists requested by the model
-        input_systems = _compute_requested_neighbors(
-            systems=systems,
-            requested_options=self._model.requested_neighbor_lists(),
-            check_consistency=self.parameters["check_consistency"],
-        )
+        input_systems = self._compute_neighbors_for_systems(systems)
 
         predictions = self._model(
             systems=input_systems,
@@ -1541,3 +1562,48 @@ def _compute_requested_neighbors_nvalchemi(systems, requested_options):
             system.add_neighbor_list(options, neighbors)
 
     return systems
+
+
+def _compute_requested_neighbors_with_skin(
+    systems: List[System],
+    requested_options: List[NeighborListOptions],
+    check_consistency: bool,
+    skin: float,
+    verlet_cache: Dict,
+) -> None:
+    """
+    Compute neighbor lists using Verlet caching for strict=False options.
+    Falls back to stateless computation for strict=True options.
+    """
+    strict_options = []
+    verlet_options = []
+
+    for options in requested_options:
+        if options.strict:
+            strict_options.append(options)
+        else:
+            verlet_options.append(options)
+
+    # Handle strict options with the existing stateless path
+    if strict_options:
+        _compute_requested_neighbors(
+            systems=systems,
+            requested_options=strict_options,
+            check_consistency=check_consistency,
+        )
+
+    # Handle non-strict options with Verlet caching
+    for options in verlet_options:
+        cache_key = (options.engine_cutoff("angstrom"), options.full_list)
+        if cache_key not in verlet_cache:
+            verlet_cache[cache_key] = vesin.metatomic.VerletNeighborList(
+                options,
+                length_unit="angstrom",
+                skin=skin,
+                check_consistency=check_consistency,
+            )
+        calculator = verlet_cache[cache_key]
+
+        for system in systems:
+            neighbors = calculator.compute(system)
+            system.add_neighbor_list(options, neighbors)
