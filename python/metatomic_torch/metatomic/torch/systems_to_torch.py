@@ -15,13 +15,32 @@ except ImportError:
     HAS_ASE = False
 
 
+try:
+    import pyscf
+
+    HAS_PYSCF = True
+except ImportError:
+    HAS_PYSCF = False
+
+
+try:
+    import chemfiles
+
+    HAS_CHEMFILES = True
+except ImportError:
+    HAS_CHEMFILES = False
+
+
 class IntoSystem:
     """
     A type that can be converted into a :py:class:`metatomic.torch.System`.
 
     This is an abstract class that is used to indicate a class whose objects can be
-    converted into a :py:class:`System`. For the moment, the only supported type is
-    :py:class:`ase.Atoms`.
+    converted into a :py:class:`System`. Supported types are:
+
+    - :py:class:`ase.Atoms`: the Atomistic Simulation Environment Atoms class
+    - :py:class:`pyscf.gto.mole.Mole` or :py:class:`pyscf.pbc.gto.cell.Cell`: pyscf system types
+    - :py:class:`chemfiles.Frame`: chemfiles frame type
     """
 
 
@@ -35,6 +54,12 @@ def systems_to_torch(
     """
     Convert a system or a list of systems into a ``metatomic.torch.System`` or a list
     of such objects.
+
+    This function supports multiple input types through automatic type detection:
+
+    - ASE Atoms objects (requires ``ase`` package)
+    - PySCF Mole or Cell objects (requires ``pyscf`` package)
+    - Chemfiles Frame objects (requires ``chemfiles`` package)
 
     :param systems: The system or list of systems to convert.
     :param dtype: The dtype of the output tensors. If ``None``, the default
@@ -73,7 +98,7 @@ def _system_to_torch(
     cell_requires_grad: Optional[bool],
 ) -> System:
     """
-    Converts an ASE Atoms object into a ``metatomic.torch.System``.
+    Converts a system into a ``metatomic.torch.System``.
 
     :param system: The system to convert.
     :param dtype: The dtype of the output tensors. If ``None``, the default
@@ -87,38 +112,58 @@ def _system_to_torch(
 
     :return: The converted system.
     """
-    if not HAS_ASE:
-        raise RuntimeError("The `ase` package is required to convert systems to torch.")
-
-    if not isinstance(system, ase.Atoms):
-        raise ValueError(
-            "Only `ase.Atoms` objects can be converted to `System`s "
-            f"for now; got {type(system)}."
-        )
-
     if dtype is None:
-        # this is necessary because creating torch tensors from numpy arrays
-        # takes the dtype from the numpy array, which is not always the default
-        # dtype
         dtype = torch.get_default_dtype()
 
-    # Handle requires_grad: if None, preserve existing requires_grad if input is
-    # already a tensor, otherwise default to False
+    # Handle requires_grad: if None, default to False
     if positions_requires_grad is None:
         positions_requires_grad = False
     if cell_requires_grad is None:
         cell_requires_grad = False
 
-    positions = torch.tensor(
-        system.positions,
-        requires_grad=positions_requires_grad,
-        dtype=dtype,
-        device=device,
+    # Detect system type and extract data
+    if HAS_ASE and isinstance(system, ase.Atoms):
+        types, positions, cell, pbc = _extract_from_ase(system)
+    elif HAS_PYSCF:
+        result = _try_extract_from_pyscf(system)
+        if result is not None:
+            types, positions, cell, pbc = result
+        else:
+            raise TypeError(f"unknown system type: {type(system)}")
+    elif HAS_CHEMFILES:
+        result = _try_extract_from_chemfiles(system)
+        if result is not None:
+            types, positions, cell, pbc = result
+        else:
+            raise TypeError(f"unknown system type: {type(system)}")
+    else:
+        raise TypeError(f"unknown system type: {type(system)}")
+
+    # Create torch tensors with proper dtype/device
+    types_tensor = torch.tensor(types, dtype=torch.int32, device=device)
+    positions_tensor = torch.tensor(positions, dtype=dtype, device=device)
+    cell_tensor = torch.tensor(cell, dtype=dtype, device=device)
+    pbc_tensor = torch.tensor(pbc, dtype=torch.bool, device=device)
+
+    # Apply requires_grad if requested
+    if positions_requires_grad:
+        positions_tensor.requires_grad_(True)
+    if cell_requires_grad:
+        cell_tensor.requires_grad_(True)
+
+    return System(
+        positions=positions_tensor,
+        cell=cell_tensor,
+        types=types_tensor,
+        pbc=pbc_tensor,
     )
 
+
+def _extract_from_ase(atoms):
+    """Extract system data from ASE Atoms object."""
     # Careful PBC handling: check for mismatched cell vectors and PBC flags
-    cell_vectors_are_not_zero = np.any(system.cell != 0, axis=1)
-    if not np.all(cell_vectors_are_not_zero == system.pbc):
+    cell_vectors_are_not_zero = np.any(atoms.cell != 0, axis=1)
+    if not np.all(cell_vectors_are_not_zero == atoms.pbc):
         warnings.warn(
             "A conversion to `System` was requested for an `ase.Atoms` object "
             "with one or more non-zero cell vectors but where the corresponding "
@@ -127,18 +172,82 @@ def _system_to_torch(
             stacklevel=3,
         )
 
-    cell = torch.zeros((3, 3), dtype=dtype, device=device)
+    # Build cell tensor, zeroing out non-periodic directions
+    cell = np.zeros((3, 3), dtype=np.float64)
+    pbc = np.array(atoms.pbc, dtype=bool)
+    cell[pbc] = atoms.cell[pbc]
 
-    pbc = torch.tensor(system.pbc, dtype=torch.bool, device=device)
+    return atoms.numbers, atoms.positions, cell, pbc
 
-    cell[pbc] = torch.tensor(system.cell[system.pbc], dtype=dtype, device=device)
 
-    types = torch.tensor(system.numbers, device=device, dtype=torch.int32)
+def _try_extract_from_pyscf(mol):
+    """Try to extract system data from PySCF Mole or Cell object."""
+    if not HAS_PYSCF:
+        return None
 
-    result = System(positions=positions, cell=cell, types=types, pbc=pbc)
+    # Check for Mole or Cell
+    if isinstance(mol, pyscf.gto.mole.Mole):
+        # Extract from Mole
+        positions = np.array(mol.atom_coords())
+        numbers = np.array([mol.atom_charge(i) for i in range(mol.natm)])
 
-    # Apply requires_grad to cell if requested
-    if cell_requires_grad:
-        result.cell.requires_grad_(True)
+        # Check if it's a periodic calculation
+        if hasattr(mol, 'a') and mol.a is not None:
+            cell = np.array(mol.a)
+            pbc = np.array([True, True, True])
+        else:
+            cell = np.zeros((3, 3), dtype=np.float64)
+            pbc = np.array([False, False, False])
 
-    return result
+        return numbers, positions, cell, pbc
+
+    return None
+
+
+def _try_extract_from_chemfiles(frame):
+    """Try to extract system data from Chemfiles Frame object."""
+    if not HAS_CHEMFILES:
+        return None
+
+    if isinstance(frame, chemfiles.Frame):
+        # Extract from Frame
+        topology = frame.topology
+        positions = frame.positions
+        cell = frame.unit_cell
+
+        # Get atomic numbers from atom types
+        numbers = []
+        for atom in topology.atoms:
+            # Try to get atomic number, fallback to mass-based guess
+            atomic_num = atom.atomic_number
+            if atomic_num == 0:
+                # Guess from mass (approximate)
+                mass = atom.mass
+                if mass < 2:
+                    atomic_num = 1  # H
+                elif mass < 5:
+                    atomic_num = 2  # He
+                else:
+                    atomic_num = int(round(mass / 2))  # Rough guess
+            numbers.append(atomic_num)
+
+        numbers = np.array(numbers, dtype=np.int32)
+
+        # Convert cell to matrix form
+        cell_matrix = np.zeros((3, 3), dtype=np.float64)
+        if cell is not None:
+            # Chemfiles stores cell as [a, b, c, alpha, beta, gamma]
+            # or as a matrix - check which format
+            if hasattr(cell, 'shape') and cell.shape == (3, 3):
+                cell_matrix = np.array(cell)
+            else:
+                # Assume orthorhombic if we get lengths
+                cell_matrix[0, 0] = cell[0] if len(cell) > 0 else 0.0
+                cell_matrix[1, 1] = cell[1] if len(cell) > 1 else 0.0
+                cell_matrix[2, 2] = cell[2] if len(cell) > 2 else 0.0
+
+        pbc = np.array([True, True, True]) if np.any(cell_matrix != 0) else np.array([False, False, False])
+
+        return numbers, positions, cell_matrix, pbc
+
+    return None
