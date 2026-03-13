@@ -7,6 +7,15 @@ import torch
 from . import System
 
 
+# Try to import featomic's implementation (preferred)
+try:
+    from featomic.torch import systems_to_torch as _featomic_systems_to_torch
+
+    HAS_FEAUTOMIC = True
+except ImportError:
+    HAS_FEAUTOMIC = False
+
+
 try:
     import ase
 
@@ -29,25 +38,45 @@ def systems_to_torch(
     systems: Union[IntoSystem, List[IntoSystem]],
     dtype: Optional[torch.dtype] = None,
     device: Optional[torch.device] = None,
-    positions_requires_grad: bool = False,
-    cell_requires_grad: bool = False,
+    positions_requires_grad: Optional[bool] = None,
+    cell_requires_grad: Optional[bool] = None,
 ) -> Union[System, List[System]]:
-    """Converts a system or a list of systems into a
-    ``metatomic.torch.System`` or a list of such objects.
+    """
+    Convert a system or a list of systems into a ``metatomic.torch.System`` or a list
+    of such objects.
 
-    :param: systems: The system or list of systems to convert.
-    :param: dtype: The dtype of the output tensors. If ``None``, the default
+    If ``featomic`` is installed, this function uses featomic's implementation which
+    supports additional system types (chemfiles, pyscf, etc.) and provides better
+    handling of existing torch Systems.
+
+    :param systems: The system or list of systems to convert.
+    :param dtype: The dtype of the output tensors. If ``None``, the default
         dtype is used.
-    :param: device: The device of the output tensors. If ``None``, the default
+    :param device: The device of the output tensors. If ``None``, the default
         device is used.
-    :param: positions_requires_grad: Whether the positions tensors of
-        the outputs should require gradients.
-    :param: cell_requires_grad: Whether the cell tensors of the outputs
-        should require gradients.
+    :param positions_requires_grad: The value of ``requires_grad`` on the output
+        ``positions``. If ``None`` and the positions of the input is already a
+        :py:class:`torch.Tensor`, ``requires_grad`` is kept the same. Otherwise it is
+        initialized to ``False``.
+    :param cell_requires_grad: The value of ``requires_grad`` on the output ``cell``. If
+        ``None`` and the cell of the input is already a :py:class:`torch.Tensor`,
+        ``requires_grad`` is kept the same. Otherwise it is initialized to ``False``.
 
     :return: The converted system or list of systems.
     """
 
+    # Use featomic's implementation if available
+    if HAS_FEAUTOMIC:
+        # featomic now handles dtype/device natively
+        return _featomic_systems_to_torch(
+            systems,
+            positions_requires_grad=positions_requires_grad,
+            cell_requires_grad=cell_requires_grad,
+            dtype=dtype,
+            device=device,
+        )
+
+    # Fallback to ASE-only implementation
     if isinstance(systems, list):
         return [
             _system_to_torch(
@@ -61,23 +90,25 @@ def systems_to_torch(
         )
 
 
+
 def _system_to_torch(
     system: IntoSystem,
     dtype: Optional[torch.dtype],
     device: Optional[torch.device],
-    positions_requires_grad: bool,
-    cell_requires_grad: bool,
+    positions_requires_grad: Optional[bool],
+    cell_requires_grad: Optional[bool],
 ) -> System:
-    """Converts a system into a ``metatomic.torch.System``.
+    """
+    Fallback implementation: Converts an ASE Atoms object into a ``metatomic.torch.System``.
 
-    :param: system: The system to convert.
-    :param: dtype: The dtype of the output tensors. If ``None``, the default
+    :param system: The system to convert.
+    :param dtype: The dtype of the output tensors. If ``None``, the default
         dtype is used.
-    :param: device: The device of the output tensors. If ``None``, the default
+    :param device: The device of the output tensors. If ``None``, the default
         device is used.
-    :param: positions_requires_grad: Whether the positions tensors of
+    :param positions_requires_grad: Whether the positions tensors of
         the outputs should require gradients.
-    :param: cell_requires_grad: Whether the cell tensors of the outputs
+    :param cell_requires_grad: Whether the cell tensors of the outputs
         should require gradients.
 
     :return: The converted system.
@@ -99,7 +130,7 @@ def _system_to_torch(
 
     positions = torch.tensor(
         system.positions,
-        requires_grad=positions_requires_grad,
+        requires_grad=positions_requires_grad or False,
         dtype=dtype,
         device=device,
     )
