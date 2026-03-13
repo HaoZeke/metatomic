@@ -36,8 +36,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-metatrain = ["metatrain"]
-
 [project.urls]
 homepage = "https://docs.metatensor.org/metatomic/latest/engines/torch-sim.html"
 documentation = "https://docs.metatensor.org/metatomic/latest/engines/torch-sim.html"

@@ -79,10 +79,9 @@ class MetatomicModel(ModelInterface):
         """Initialize the metatomic model wrapper.
 
         :param model: Model to use.  Accepts a file path to a ``.pt`` saved
-            model, a ``.ckpt`` metatrain checkpoint (requires ``metatrain``), the
-            string ``"pet-mad"`` (shortcut for the PET-MAD model, requires
-            ``metatrain``), a Python :py:class:`AtomisticModel` instance, or a
-            TorchScript :py:class:`torch.jit.RecursiveScriptModule`.
+            metatomic model (exported with ``upet``), a Python
+            :py:class:`AtomisticModel` instance, or a TorchScript
+            :py:class:`torch.jit.RecursiveScriptModule`.
         :param extensions_directory: Directory containing compiled TorchScript
             extensions required by the model, if any.
         :param device: Torch device for evaluation.  When ``None``, the best
@@ -96,22 +95,19 @@ class MetatomicModel(ModelInterface):
 
         self._check_consistency = check_consistency
 
-        # Load the model, following the same patterns as ase_calculator.py
-        if isinstance(model, str) and model == "pet-mad":
-            model = self._load_metatrain_model(
-                "https://huggingface.co/lab-cosmo/pet-mad/resolve/v1.1.0/"
-                "models/pet-mad-v1.1.0.ckpt"
-            )
-        elif isinstance(model, (str, bytes, pathlib.PurePath)):
+        # Load the model from a file path or AtomisticModel instance
+        if isinstance(model, (str, bytes, pathlib.PurePath)):
             model_path = str(model)
             if model_path.endswith(".ckpt"):
-                model = self._load_metatrain_model(model_path)
-            else:
-                if not os.path.exists(model_path):
-                    raise ValueError(f"given model path '{model_path}' does not exist")
-                model = load_atomistic_model(
-                    model_path, extensions_directory=extensions_directory
+                raise ValueError(
+                    ".ckpt files are not supported. Please export your metatrain "
+                    "model using upet: pip install upet && upet export model.ckpt"
                 )
+            if not os.path.exists(model_path):
+                raise ValueError(f"given model path '{model_path}' does not exist")
+            model = load_atomistic_model(
+                model_path, extensions_directory=extensions_directory
+            )
         elif isinstance(model, torch.jit.RecursiveScriptModule):
             if model.original_name != "AtomisticModel":
                 raise TypeError(
@@ -162,18 +158,6 @@ class MetatomicModel(ModelInterface):
             },
         )
 
-    @staticmethod
-    def _load_metatrain_model(path: str) -> AtomisticModel:
-        """Load a metatrain checkpoint and export it as an AtomisticModel."""
-        try:
-            from metatrain.utils.io import load_model
-        except ImportError as exc:
-            raise ImportError(
-                "metatrain is required to load .ckpt files or use the 'pet-mad' "
-                "shortcut: pip install metatrain"
-            ) from exc
-
-        return load_model(path).export()
 
     def forward(self, state: "ts.SimState") -> Dict[str, torch.Tensor]:
         """Compute energies, forces, and stresses for the given simulation state.

@@ -1,6 +1,6 @@
 """Tests for the MetatomicModel TorchSim wrapper.
 
-Uses the metatomic-lj-test model so that tests run without needing metatrain or
+Uses the metatomic-lj-test model so that tests run without needing
 downloading large model files.
 """
 

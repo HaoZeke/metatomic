@@ -11,12 +11,6 @@ use in TorchSim molecular dynamics and other simulation workflows.
 pip install metatomic-torchsim
 ```
 
-To use metatrain checkpoints (`.ckpt` files):
-
-```bash
-pip install metatomic-torchsim[metatrain]
-```
-
 For universal potential models, see
 [upet](https://github.com/lab-cosmo/upet).
 
@@ -25,11 +19,8 @@ For universal potential models, see
 ```python
 from metatomic_torchsim import MetatomicModel
 
-# From a saved .pt model
+# From a saved .pt model (exported with upet)
 model = MetatomicModel("model.pt", device="cuda")
-
-# From a metatrain checkpoint (requires metatrain extra)
-model = MetatomicModel("model.ckpt", device="cuda")
 
 # Use with TorchSim
 output = model(sim_state)
@@ -40,3 +31,4 @@ stress = output["stress"]
 
 For full documentation, see the
 [torch-sim engine page](https://docs.metatensor.org/metatomic/latest/engines/torch-sim.html).
+
